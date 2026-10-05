@@ -465,6 +465,25 @@ def _read_journal(mirror_dir: str):
             f" was interrupted and its state cannot be inspected: {exc}") from exc
 
 
+def _discard_unregistered_stage(mirror_dir: str) -> bool:
+    """Remove staging data that is not claimed by a recovery journal.
+
+    The journal is the boundary at which an upgrade is considered started.
+    Stage contents written before the journal are disposable preparation data;
+    without this distinction, a crash in that window makes a later rollback
+    both leave an orphan stage and falsely report that an upgrade was undone.
+    """
+    stage_path = os.path.join(mirror_dir, STAGE_NAME)
+    if not os.path.lexists(stage_path):
+        return False
+    if os.path.islink(stage_path) or os.path.isfile(stage_path):
+        os.unlink(stage_path)
+    else:
+        shutil.rmtree(stage_path)
+    _fsync_dir(mirror_dir)
+    return True
+
+
 def apply_delta(delta_dir: str, mirror_dir: str, rollback: bool = False,
                 progress=None) -> dict:
     """Apply a delta package to a local full-export mirror.
@@ -475,10 +494,13 @@ def apply_delta(delta_dir: str, mirror_dir: str, rollback: bool = False,
       * the mirror is exactly the delta's bound start release
         (or, for an idempotent re-run, its target release).
 
-    The switch is journaled. Interrupting it at any point leaves the mirror
-    recoverable: a further ``apply_delta`` call resumes forward to the target;
-    ``apply_delta(..., rollback=True)`` restores the exact start release. Both
-    outcomes pass ``verifier.verify_export``.
+    The journal is the recovery boundary. After it is registered, interrupting
+    the switch leaves the mirror recoverable: a further ``apply_delta`` call
+    resumes forward to the target, while ``apply_delta(..., rollback=True)``
+    restores the exact start release. If staging is interrupted before journal
+    registration, no switch has started: the stale stage is discarded, forward
+    apply prepares it again, and rollback reports that there was no interrupted
+    application. Every terminal state passes ``verifier.verify_export``.
     """
     def note(event):
         if progress is not None:
@@ -504,6 +526,11 @@ def apply_delta(delta_dir: str, mirror_dir: str, rollback: bool = False,
         if rollback:
             return _rollback(ctx, note)
         return _switch(ctx, note)
+
+    # Without a journal the switch has not begun. Any stage contents are
+    # unclaimed preparation artifacts from a crash before registration; remove
+    # them before validating or preparing a fresh application.
+    discarded_unregistered_stage = _discard_unregistered_stage(mirror_dir)
 
     # No interrupted switch: this must be a clean start release...
     errors = verifier.verify_export(mirror_dir)
@@ -533,10 +560,18 @@ def apply_delta(delta_dir: str, mirror_dir: str, rollback: bool = False,
     _require_baseline_match(base_manifest, meta)
 
     if rollback:
-        # Nothing was started; mirror is the clean start release.
-        return {"from_version": meta["from_version"],
-                "to_version": meta["to_version"], "rolled_back": True,
-                "note": "no interrupted application found; mirror is unchanged"}
+        # The journal is the recovery-record boundary. A stage directory alone
+        # means preparation was interrupted before the switch was registered;
+        # that preparation is discarded above, while the mirror remains the
+        # untouched start release.
+        return {
+            "from_version": meta["from_version"],
+            "to_version": meta["to_version"],
+            "rolled_back": False,
+            "no_interrupted_application": True,
+            "discarded_unregistered_stage": discarded_unregistered_stage,
+            "note": "no recovery journal found; no application was in progress",
+        }
 
     # ---- prepare: stage everything new and back up everything replaced ----
     new_dir = os.path.join(stage_path, "new")
@@ -807,6 +842,9 @@ def main(argv=None) -> int:
             if result.get("already_applied"):
                 print(f"OK: mirror already at v{result['to_version']}; "
                       "re-application changed nothing")
+            elif result.get("no_interrupted_application"):
+                print(f"OK: no interrupted application found; mirror remains at"
+                      f" v{result['from_version']}")
             elif result.get("rolled_back"):
                 print(f"OK: mirror rolled back to v{result['from_version']}")
             else:

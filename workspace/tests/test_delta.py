@@ -386,6 +386,94 @@ class DeltaCase(unittest.TestCase):
         self._assert_dirs_equal(mirror, full_v1)
         self.assertEqual(verifier.verify_export(mirror), [])
 
+    def test_unregistered_stage_is_recovery_boundary(self):
+        v1, v2, *_ = self.build_versions()
+        full_v1, full_v2 = self.export(v1), self.export(v2)
+        delta.build_delta(full_v1, full_v2, os.path.join(self.tmp, "d"))
+        pkg = os.path.join(self.tmp, "d")
+
+        def crash_before_journal(event):
+            if event == "stage-ready":
+                raise KeyboardInterrupt("power loss before recovery journal")
+
+        # Forward recovery: staging existed, but no recovery record means the
+        # switch never started. A normal apply discards the stale preparation
+        # and continues by preparing and installing the same delta safely.
+        mirror = os.path.join(self.tmp, "mirror-forward")
+        shutil.copytree(full_v1, mirror)
+        with self.assertRaises(KeyboardInterrupt):
+            delta.apply_delta(pkg, mirror, progress=crash_before_journal)
+        self.assertFalse(os.path.exists(os.path.join(mirror, delta.JOURNAL_NAME)))
+        self.assertTrue(os.path.isdir(os.path.join(mirror, delta.STAGE_NAME)))
+
+        result = delta.apply_delta(pkg, mirror)
+        self.assertFalse(result.get("already_applied"))
+        self.assertEqual(verifier.verify_export(mirror), [])
+        self._assert_dirs_equal(mirror, full_v2)
+        self.assertFalse(os.path.exists(os.path.join(mirror, delta.JOURNAL_NAME)))
+        self.assertFalse(os.path.exists(os.path.join(mirror, delta.STAGE_NAME)))
+
+        # Undo at the same unregistered point must clean up the orphan stage,
+        # leave the start release byte-identical, and not claim a rollback.
+        mirror = os.path.join(self.tmp, "mirror-rollback")
+        shutil.copytree(full_v1, mirror)
+        with self.assertRaises(KeyboardInterrupt):
+            delta.apply_delta(pkg, mirror, progress=crash_before_journal)
+        result = delta.apply_delta(pkg, mirror, rollback=True)
+        self.assertFalse(result.get("rolled_back"))
+        self.assertTrue(result["no_interrupted_application"])
+        self.assertTrue(result["discarded_unregistered_stage"])
+        self.assertEqual(verifier.verify_export(mirror), [])
+        self._assert_dirs_equal(mirror, full_v1)
+        self.assertFalse(os.path.exists(os.path.join(mirror, delta.JOURNAL_NAME)))
+        self.assertFalse(os.path.exists(os.path.join(mirror, delta.STAGE_NAME)))
+
+        # A partial stage (crash while writing it) is also disposable.
+        mirror = os.path.join(self.tmp, "mirror-partial")
+        shutil.copytree(full_v1, mirror)
+        partial = os.path.join(mirror, delta.STAGE_NAME, "new")
+        os.makedirs(partial)
+        with open(os.path.join(partial, "partial.tmp"), "wb") as fh:
+            fh.write(b"partial")
+        result = delta.apply_delta(pkg, mirror, rollback=True)
+        self.assertTrue(result["no_interrupted_application"])
+        self._assert_dirs_equal(mirror, full_v1)
+        self.assertFalse(os.path.exists(os.path.join(mirror, delta.STAGE_NAME)))
+
+    def test_registered_interruption_continues_or_undoes_same_delta(self):
+        v1, v2, *_ = self.build_versions()
+        full_v1, full_v2 = self.export(v1), self.export(v2)
+        delta.build_delta(full_v1, full_v2, os.path.join(self.tmp, "d"))
+        pkg = os.path.join(self.tmp, "d")
+
+        def crash_after_journal(event):
+            if event == "prepared":
+                raise KeyboardInterrupt("power loss after recovery journal")
+
+        # Registered point: continue forward with the same package.
+        mirror = os.path.join(self.tmp, "mirror-registered-forward")
+        shutil.copytree(full_v1, mirror)
+        with self.assertRaises(KeyboardInterrupt):
+            delta.apply_delta(pkg, mirror, progress=crash_after_journal)
+        self.assertTrue(os.path.isfile(os.path.join(mirror, delta.JOURNAL_NAME)))
+        result = delta.apply_delta(pkg, mirror)
+        self.assertFalse(result.get("already_applied"))
+        self.assertEqual(verifier.verify_export(mirror), [])
+        self._assert_dirs_equal(mirror, full_v2)
+
+        # Registered point: undo with the same package.
+        mirror = os.path.join(self.tmp, "mirror-registered-rollback")
+        shutil.copytree(full_v1, mirror)
+        with self.assertRaises(KeyboardInterrupt):
+            delta.apply_delta(pkg, mirror, progress=crash_after_journal)
+        result = delta.apply_delta(pkg, mirror, rollback=True)
+        self.assertTrue(result["rolled_back"])
+        self.assertNotIn("no_interrupted_application", result)
+        self.assertEqual(verifier.verify_export(mirror), [])
+        self._assert_dirs_equal(mirror, full_v1)
+        self.assertFalse(os.path.exists(os.path.join(mirror, delta.JOURNAL_NAME)))
+        self.assertFalse(os.path.exists(os.path.join(mirror, delta.STAGE_NAME)))
+
     def test_foreign_journal_rejected(self):
         v1, v2, *_ = self.build_versions()
         # a third release for a different delta
@@ -451,6 +539,10 @@ class DeltaCase(unittest.TestCase):
         r = run("check", pkg, "--baseline", mirror)
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertIn("baseline matches", r.stdout)
+
+        r = run("apply", pkg, mirror, "--rollback")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("no interrupted application found", r.stdout)
 
         r = run("apply", pkg, mirror)
         self.assertEqual(r.returncode, 0, r.stderr)
