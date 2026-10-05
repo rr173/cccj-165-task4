@@ -36,7 +36,11 @@ Trust chain
       deleted bucket backed up under ``.delta-stage/``;
     - an interrupted switch is resumed forward to completion, or rolled back
       to the exact start release with ``--rollback`` -- in every terminal
-      state the mirror passes the original ``verifier.verify_export``.
+      state the mirror passes the original ``verifier.verify_export``;
+    - a crash after staging but before the journal is registered leaves only
+      an orphaned ``.delta-stage/`` beside the untouched mirror: the next
+      ``apply`` discards it and stages fresh, and ``--rollback`` removes it
+      while reporting truthfully that there was nothing to roll back.
 
 Applying an already-completed delta is a no-op that verifies the target.
 
@@ -465,6 +469,23 @@ def _read_journal(mirror_dir: str):
             f" was interrupted and its state cannot be inspected: {exc}") from exc
 
 
+def _remove_orphan_stage(stage_path: str) -> bool:
+    """Drop a staging area that was never registered in a journal -- the
+    crash window between staging and the journal write. Returns True when
+    something was removed.
+
+    Only called once the mirror itself has been verified as a valid release,
+    so the staged payloads and backups it holds are known to be redundant,
+    re-derivable data."""
+    if os.path.islink(stage_path) or os.path.isfile(stage_path):
+        os.unlink(stage_path)
+        return True
+    if os.path.isdir(stage_path):
+        shutil.rmtree(stage_path, ignore_errors=True)
+        return True
+    return False
+
+
 def apply_delta(delta_dir: str, mirror_dir: str, rollback: bool = False,
                 progress=None) -> dict:
     """Apply a delta package to a local full-export mirror.
@@ -533,10 +554,26 @@ def apply_delta(delta_dir: str, mirror_dir: str, rollback: bool = False,
     _require_baseline_match(base_manifest, meta)
 
     if rollback:
-        # Nothing was started; mirror is the clean start release.
+        # No journal was ever registered: the switch never began, so there is
+        # nothing to roll back -- the mirror verified above is still the exact
+        # start release. A crash between staging and the journal write may
+        # have orphaned the staging area; remove it rather than leaving it
+        # behind, and report truthfully that nothing was rolled back.
+        removed = _remove_orphan_stage(stage_path)
+        if removed:
+            _fsync_dir(mirror_dir)
         return {"from_version": meta["from_version"],
-                "to_version": meta["to_version"], "rolled_back": True,
+                "to_version": meta["to_version"],
+                "rolled_back": False,
+                "nothing_to_roll_back": True,
+                "orphan_stage_removed": removed,
                 "note": "no interrupted application found; mirror is unchanged"}
+
+    # A crash between staging and the journal write leaves an orphaned
+    # staging area beside the untouched mirror. It is entirely re-derivable,
+    # and re-staging over it could trip on its hard-linked backups, so drop
+    # it before staging fresh.
+    _remove_orphan_stage(stage_path)
 
     # ---- prepare: stage everything new and back up everything replaced ----
     new_dir = os.path.join(stage_path, "new")
@@ -809,6 +846,12 @@ def main(argv=None) -> int:
                       "re-application changed nothing")
             elif result.get("rolled_back"):
                 print(f"OK: mirror rolled back to v{result['from_version']}")
+            elif result.get("nothing_to_roll_back"):
+                msg = (f"OK: nothing to roll back; mirror never left "
+                       f"v{result['from_version']}")
+                if result.get("orphan_stage_removed"):
+                    msg += "; removed leftover staging data"
+                print(msg)
             else:
                 print(f"OK: applied v{result['from_version']} -> "
                       f"v{result['to_version']} "

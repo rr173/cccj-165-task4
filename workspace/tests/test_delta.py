@@ -386,6 +386,119 @@ class DeltaCase(unittest.TestCase):
         self._assert_dirs_equal(mirror, full_v1)
         self.assertEqual(verifier.verify_export(mirror), [])
 
+    # ---------------- crash after staging, before the journal is registered
+    def test_unjournaled_stage_resumes_forward(self):
+        v1, v2, *_ = self.build_versions()
+        full_v1, full_v2 = self.export(v1), self.export(v2)
+        delta.build_delta(full_v1, full_v2, os.path.join(self.tmp, "d"))
+        pkg = os.path.join(self.tmp, "d")
+        mirror = os.path.join(self.tmp, "mirror")
+        shutil.copytree(full_v1, mirror)
+
+        def boom(event):
+            if event == "stage-ready":
+                raise KeyboardInterrupt("power lost before journal registration")
+
+        with self.assertRaises(KeyboardInterrupt):
+            delta.apply_delta(pkg, mirror, progress=boom)
+        # staged but never registered: orphan stage, no journal, mirror intact
+        self.assertFalse(os.path.exists(os.path.join(mirror, delta.JOURNAL_NAME)))
+        self.assertTrue(os.path.isdir(os.path.join(mirror, delta.STAGE_NAME)))
+        self.assertEqual(verifier.verify_export(mirror), [])
+        self.assertEqual(
+            read_json(os.path.join(mirror, "manifest.json"))["manifest_sha256"],
+            read_json(os.path.join(full_v1, "manifest.json"))["manifest_sha256"])
+
+        # a plain re-run discards the orphan and completes the same switch
+        result = delta.apply_delta(pkg, mirror)
+        self.assertFalse(result.get("already_applied"))
+        self.assertEqual((result["from_version"], result["to_version"]), (v1, v2))
+        self.assertEqual(verifier.verify_export(mirror), [])
+        self._assert_dirs_equal(mirror, full_v2)
+        self.assertFalse(os.path.exists(os.path.join(mirror, delta.JOURNAL_NAME)))
+        self.assertFalse(os.path.isdir(os.path.join(mirror, delta.STAGE_NAME)))
+
+    def test_unjournaled_stage_rollback_cleans_up_without_misreporting(self):
+        v1, v2, *_ = self.build_versions()
+        full_v1, full_v2 = self.export(v1), self.export(v2)
+        delta.build_delta(full_v1, full_v2, os.path.join(self.tmp, "d"))
+        pkg = os.path.join(self.tmp, "d")
+        mirror = os.path.join(self.tmp, "mirror")
+        shutil.copytree(full_v1, mirror)
+
+        def boom(event):
+            if event == "stage-ready":
+                raise KeyboardInterrupt("power lost before journal registration")
+
+        with self.assertRaises(KeyboardInterrupt):
+            delta.apply_delta(pkg, mirror, progress=boom)
+        self.assertTrue(os.path.isdir(os.path.join(mirror, delta.STAGE_NAME)))
+
+        result = delta.apply_delta(pkg, mirror, rollback=True)
+        # the switch never began: nothing was rolled back...
+        self.assertFalse(result["rolled_back"])
+        self.assertTrue(result["nothing_to_roll_back"])
+        self.assertTrue(result["orphan_stage_removed"])
+        # ...and no orphaned staging directory is left behind
+        self.assertFalse(os.path.exists(os.path.join(mirror, delta.STAGE_NAME)))
+        self.assertFalse(os.path.exists(os.path.join(mirror, delta.JOURNAL_NAME)))
+        # the mirror is still exactly the valid start release
+        self.assertEqual(verifier.verify_export(mirror), [])
+        self._assert_dirs_equal(mirror, full_v1)
+
+    def test_unjournaled_partial_stage_with_hardlinks_resumes_forward(self):
+        v1, v2, *_ = self.build_versions()
+        full_v1, full_v2 = self.export(v1), self.export(v2)
+        delta.build_delta(full_v1, full_v2, os.path.join(self.tmp, "d"))
+        pkg = os.path.join(self.tmp, "d")
+        mirror = os.path.join(self.tmp, "mirror")
+        shutil.copytree(full_v1, mirror)
+
+        # emulate an orphaned stage exactly as staging leaves it: baseline
+        # backups hard-linked to the live buckets, a partial staged payload
+        stage = os.path.join(mirror, delta.STAGE_NAME)
+        os.makedirs(os.path.join(stage, "new"))
+        os.makedirs(os.path.join(stage, "old"))
+        try:
+            os.link(os.path.join(mirror, "buckets", "A1.txt"),
+                    os.path.join(stage, "old", "A1.txt"))
+        except OSError:  # filesystem without hard links
+            shutil.copyfile(os.path.join(mirror, "buckets", "A1.txt"),
+                            os.path.join(stage, "old", "A1.txt"))
+        with open(os.path.join(stage, "new", "A1.txt"), "wb") as fh:
+            fh.write(b"partial garbage")
+
+        result = delta.apply_delta(pkg, mirror)
+        self.assertEqual((result["from_version"], result["to_version"]), (v1, v2))
+        self.assertEqual(verifier.verify_export(mirror), [])
+        self._assert_dirs_equal(mirror, full_v2)
+        self.assertFalse(os.path.isdir(os.path.join(mirror, delta.STAGE_NAME)))
+
+    def test_rollback_on_clean_mirror_reports_nothing_to_do(self):
+        v1, v2, *_ = self.build_versions()
+        full_v1, full_v2 = self.export(v1), self.export(v2)
+        delta.build_delta(full_v1, full_v2, os.path.join(self.tmp, "d"))
+        pkg = os.path.join(self.tmp, "d")
+        mirror = os.path.join(self.tmp, "mirror")
+        shutil.copytree(full_v1, mirror)
+
+        result = delta.apply_delta(pkg, mirror, rollback=True)
+        self.assertFalse(result["rolled_back"])
+        self.assertTrue(result["nothing_to_roll_back"])
+        self.assertFalse(result["orphan_stage_removed"])
+        self.assertEqual(verifier.verify_export(mirror), [])
+        self._assert_dirs_equal(mirror, full_v1)
+
+        # the CLI says the same and still exits 0
+        env = dict(os.environ, PYTHONPATH="/workspace")
+        r = subprocess.run(
+            [sys.executable, "-m", "pwncorpus.delta", "apply", pkg, mirror,
+             "--rollback"],
+            capture_output=True, text=True, env=env)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("nothing to roll back", r.stdout)
+        self.assertNotIn("rolled back to", r.stdout)
+
     def test_foreign_journal_rejected(self):
         v1, v2, *_ = self.build_versions()
         # a third release for a different delta
